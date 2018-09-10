@@ -20,6 +20,7 @@
 		error.proto
 		evacuation.proto
 		events.proto
+		image_layer.proto
 		modification_tag.proto
 		network.proto
 		ping.proto
@@ -58,6 +59,8 @@
 		FailActualLRPRequest
 		RetireActualLRPRequest
 		RemoveActualLRPRequest
+		ActualLRPsResponse
+		ActualLRPsRequest
 		CachedDependency
 		CellCapacity
 		CellPresence
@@ -107,6 +110,7 @@
 		TaskCreatedEvent
 		TaskChangedEvent
 		TaskRemovedEvent
+		ImageLayer
 		ModificationTag
 		Network
 		PingResponse
@@ -120,6 +124,7 @@
 		StartTaskRequest
 		StartTaskResponse
 		FailTaskRequest
+		RejectTaskRequest
 		TaskGuidRequest
 		CompleteTaskRequest
 		TaskCallbackResponse

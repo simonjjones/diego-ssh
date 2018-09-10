@@ -31,8 +31,10 @@ type ActualLRPChange struct {
 }
 
 type ActualLRPFilter struct {
-	Domain string
-	CellID string
+	Domain      string
+	CellID      string
+	ProcessGuid string
+	Index       *int32
 }
 
 func NewActualLRPKey(processGuid string, index int32, domain string) ActualLRPKey {
@@ -160,22 +162,22 @@ func NewEvacuatingActualLRPGroup(actualLRP *ActualLRP) *ActualLRPGroup {
 	}
 }
 
-func (group ActualLRPGroup) Resolve() (*ActualLRP, bool) {
+func (group ActualLRPGroup) Resolve() (*ActualLRP, bool, error) {
 	switch {
 	case group.Instance == nil && group.Evacuating == nil:
-		panic(ErrActualLRPGroupInvalid)
+		return nil, false, ErrActualLRPGroupInvalid
 
 	case group.Instance == nil:
-		return group.Evacuating, true
+		return group.Evacuating, true, nil
 
 	case group.Evacuating == nil:
-		return group.Instance, false
+		return group.Instance, false, nil
 
 	case group.Instance.State == ActualLRPStateRunning || group.Instance.State == ActualLRPStateCrashed:
-		return group.Instance, false
+		return group.Instance, false, nil
 
 	default:
-		return group.Evacuating, true
+		return group.Evacuating, true, nil
 	}
 }
 
@@ -210,6 +212,19 @@ func (*ActualLRP) Version() format.Version {
 	return format.V0
 }
 
+func (actual *ActualLRP) ToActualLRPGroup() *ActualLRPGroup {
+	if actual == nil {
+		return nil
+	}
+
+	switch actual.Presence {
+	case ActualLRP_Evacuating:
+		return &ActualLRPGroup{Evacuating: actual}
+	default:
+		return &ActualLRPGroup{Instance: actual}
+	}
+}
+
 func (actual ActualLRP) Validate() error {
 	var validationError ValidationError
 
@@ -229,6 +244,9 @@ func (actual ActualLRP) Validate() error {
 		}
 		if !actual.ActualLRPNetInfo.Empty() {
 			validationError = validationError.Append(errors.New("net info cannot be set when state is unclaimed"))
+		}
+		if actual.Presence != ActualLRP_Ordinary {
+			validationError = validationError.Append(errors.New("presence cannot be set when state is unclaimed"))
 		}
 
 	case ActualLRPStateClaimed:
