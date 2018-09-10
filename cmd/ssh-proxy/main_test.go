@@ -540,15 +540,20 @@ var _ = Describe("SSH proxy", func() {
 
 			BeforeEach(func() {
 				var err error
-				testIngressServer, err = testhelpers.NewTestIngressServer("fixtures/metron/metron.crt", "fixtures/metron/metron.key", "fixtures/metron/CA.crt")
+				testIngressServer, err = testhelpers.NewTestIngressServer(
+					"fixtures/metron/metron.crt",
+					"fixtures/metron/metron.key",
+					"fixtures/metron/CA.crt",
+				)
 				Expect(err).NotTo(HaveOccurred())
 				receiversChan := testIngressServer.Receivers()
-				testIngressServer.Start()
+				Expect(testIngressServer.Start()).To(Succeed())
 				port, err := strconv.Atoi(strings.TrimPrefix(testIngressServer.Addr(), "127.0.0.1:"))
 				Expect(err).NotTo(HaveOccurred())
 				sshProxyConfig.LoggregatorConfig.BatchFlushInterval = 10 * time.Millisecond
 				sshProxyConfig.LoggregatorConfig.BatchMaxSize = 1
 				sshProxyConfig.LoggregatorConfig.APIPort = port
+				sshProxyConfig.LoggregatorConfig.UseV2API = true
 				sshProxyConfig.LoggregatorConfig.CACertPath = "fixtures/metron/CA.crt"
 				sshProxyConfig.LoggregatorConfig.KeyPath = "fixtures/metron/client.key"
 				sshProxyConfig.LoggregatorConfig.CertPath = "fixtures/metron/client.crt"
@@ -561,30 +566,42 @@ var _ = Describe("SSH proxy", func() {
 				close(signalMetricsChan)
 			})
 
-			JustBeforeEach(func() {
-				client, err := ssh.Dial("tcp", address, clientConfig)
-				Expect(err).NotTo(HaveOccurred())
-				_, err = client.NewSession()
-				Expect(err).NotTo(HaveOccurred())
-			})
-
-			Context("when using loggregator v2 api", func() {
+			Context("when the loggregator server isn't up", func() {
 				BeforeEach(func() {
-					sshProxyConfig.LoggregatorConfig.UseV2API = true
+					testIngressServer.Stop()
 				})
 
-				It("emits the number of current ssh-connections", func() {
-					Eventually(testMetricsChan).Should(Receive(testhelpers.MatchV2MetricAndValue(testhelpers.MetricAndValue{Name: "ssh-connections", Value: int32(1)})))
+				It("exits with non-zero status code", func() {
+					Eventually(process.Wait()).Should(Receive(HaveOccurred()))
 				})
 			})
 
-			Context("when not using the loggregator v2 api", func() {
-				BeforeEach(func() {
-					sshProxyConfig.LoggregatorConfig.UseV2API = false
+			Context("when the loggregator agent is up", func() {
+				JustBeforeEach(func() {
+					client, err := ssh.Dial("tcp", address, clientConfig)
+					Expect(err).NotTo(HaveOccurred())
+					_, err = client.NewSession()
+					Expect(err).NotTo(HaveOccurred())
 				})
 
-				It("doesn't emit any metrics", func() {
-					Consistently(testMetricsChan).ShouldNot(Receive())
+				Context("when using loggregator v2 api", func() {
+					BeforeEach(func() {
+						sshProxyConfig.LoggregatorConfig.UseV2API = true
+					})
+
+					It("emits the number of current ssh-connections", func() {
+						Eventually(testMetricsChan).Should(Receive(testhelpers.MatchV2MetricAndValue(testhelpers.MetricAndValue{Name: "ssh-connections", Value: int32(1)})))
+					})
+				})
+
+				Context("when not using the loggregator v2 api", func() {
+					BeforeEach(func() {
+						sshProxyConfig.LoggregatorConfig.UseV2API = false
+					})
+
+					It("doesn't emit any metrics", func() {
+						Consistently(testMetricsChan).ShouldNot(Receive())
+					})
 				})
 			})
 		})
@@ -597,6 +614,18 @@ var _ = Describe("SSH proxy", func() {
 			It("rejects the cipher algorithm", func() {
 				_, err := ssh.Dial("tcp", address, clientConfig)
 				Expect(err).To(MatchError(ContainSubstring("ssh: no common algorithm for client to server cipher")))
+				Expect(fakeBBS.ReceivedRequests()).To(HaveLen(0))
+			})
+		})
+
+		Context("when the proxy provides the default cipher algorithms", func() {
+			BeforeEach(func() {
+				clientConfig.Ciphers = []string{"arcfour128"}
+			})
+
+			It("errors when the client doesn't provide any of the algorithms: 'chacha20-poly1305@openssh.com', 'aes128-gcm@openssh.com', 'aes128-gcm@openssh.com', 'aes256-ctr', 'aes192-ctr', 'aes128-ctr'", func() {
+				_, err := ssh.Dial("tcp", address, clientConfig)
+				Expect(err).To(MatchError("ssh: handshake failed: ssh: no common algorithm for client to server cipher; client offered: [arcfour128], server offered: [chacha20-poly1305@openssh.com aes128-gcm@openssh.com aes256-ctr aes192-ctr aes128-ctr]"))
 				Expect(fakeBBS.ReceivedRequests()).To(HaveLen(0))
 			})
 		})
@@ -651,6 +680,18 @@ var _ = Describe("SSH proxy", func() {
 			})
 		})
 
+		Context("when the proxy provides the default MAC algorithm", func() {
+			BeforeEach(func() {
+				clientConfig.MACs = []string{"arcfour128"}
+			})
+
+			It("errors when the client doesn't provide one of the algorithms: 'hmac-sha2-256-etm@openssh.com', 'hmac-sha2-256'", func() {
+				_, err := ssh.Dial("tcp", address, clientConfig)
+				Expect(err).To(MatchError("ssh: handshake failed: ssh: no common algorithm for client to server MAC; client offered: [arcfour128], server offered: [hmac-sha2-256-etm@openssh.com hmac-sha2-256]"))
+				Expect(fakeBBS.ReceivedRequests()).To(HaveLen(0))
+			})
+		})
+
 		Context("when the proxy provides an unsupported key exchange algorithm", func() {
 			BeforeEach(func() {
 				sshProxyConfig.AllowedKeyExchanges = "unsupported"
@@ -679,6 +720,18 @@ var _ = Describe("SSH proxy", func() {
 
 				err = client.Close()
 				Expect(err).NotTo(HaveOccurred())
+			})
+		})
+
+		Context("when the proxy provides the default KeyExchange algorithm", func() {
+			BeforeEach(func() {
+				clientConfig.KeyExchanges = []string{"arcfour128"}
+			})
+
+			It("errors when the client doesn't provide the algorithm: 'curve25519-sha256@libssh.org'", func() {
+				_, err := ssh.Dial("tcp", address, clientConfig)
+				Expect(err).To(MatchError("ssh: handshake failed: ssh: no common algorithm for key exchange; client offered: [arcfour128], server offered: [curve25519-sha256@libssh.org]"))
+				Expect(fakeBBS.ReceivedRequests()).To(HaveLen(0))
 			})
 		})
 

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"code.cloudfoundry.org/diego-ssh/cmd/sshd/testrunner"
@@ -391,6 +393,25 @@ var _ = Describe("SSH daemon", func() {
 			})
 		})
 
+		Context("when the daemon provides an unsupported cipher algorithm", func() {
+			BeforeEach(func() {
+				allowUnauthenticatedClients = true
+				clientConfig = &ssh.ClientConfig{
+					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+				}
+				clientConfig.Ciphers = []string{"arcfour128"}
+			})
+
+			It("starts the daemon", func() {
+				Expect(process).NotTo(BeNil())
+			})
+
+			It("errors when the client doesn't provide one of the algorithm: 'chacha20-poly1305@openssh.com', 'aes128-gcm@openssh.com', 'aes256-ctr', 'aes192-ctr', 'aes128-ctr'", func() {
+				Expect(dialErr).To(MatchError("ssh: handshake failed: ssh: no common algorithm for client to server cipher; client offered: [arcfour128], server offered: [chacha20-poly1305@openssh.com aes128-gcm@openssh.com aes256-ctr aes192-ctr aes128-ctr]"))
+				Expect(client).To(BeNil())
+			})
+		})
+
 		Context("when the daemon provides an unsupported MAC algorithm", func() {
 			BeforeEach(func() {
 				allowedMACs = "unsupported"
@@ -428,7 +449,26 @@ var _ = Describe("SSH daemon", func() {
 			})
 		})
 
-		Context("when the daemon provides an unsupported key exchange algorithm", func() {
+		Context("when the daemon provides an unsupported MAC algorithm", func() {
+			BeforeEach(func() {
+				allowUnauthenticatedClients = true
+				clientConfig = &ssh.ClientConfig{
+					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+				}
+				clientConfig.MACs = []string{"arcfour128"}
+			})
+
+			It("starts the daemon", func() {
+				Expect(process).NotTo(BeNil())
+			})
+
+			It("errors when the client doesn't provide one of the algorithms: 'hmac-sha2-256-etm@openssh.com', 'hmac-sha2-256'", func() {
+				Expect(dialErr).To(MatchError("ssh: handshake failed: ssh: no common algorithm for client to server MAC; client offered: [arcfour128], server offered: [hmac-sha2-256-etm@openssh.com hmac-sha2-256]"))
+				Expect(client).To(BeNil())
+			})
+		})
+
+		Context("when the daemon provides an unsupported key exchange algorithm by the proxy", func() {
 			BeforeEach(func() {
 				allowedKeyExchanges = "unsupported"
 				clientConfig = &ssh.ClientConfig{
@@ -462,6 +502,25 @@ var _ = Describe("SSH daemon", func() {
 			It("allows a client to complete a handshake", func() {
 				Expect(dialErr).NotTo(HaveOccurred())
 				Expect(client).NotTo(BeNil())
+			})
+		})
+
+		Context("when the daemon provides an unsupported KeyExchange algorithm", func() {
+			BeforeEach(func() {
+				allowUnauthenticatedClients = true
+				clientConfig = &ssh.ClientConfig{
+					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+				}
+				clientConfig.KeyExchanges = []string{"arcfour128"}
+			})
+
+			It("starts the daemon", func() {
+				Expect(process).NotTo(BeNil())
+			})
+
+			It("errors when the client doesn't provide the algorithm: 'curve25519-sha256@libssh.org'", func() {
+				Expect(dialErr).To(MatchError("ssh: handshake failed: ssh: no common algorithm for key exchange; client offered: [arcfour128], server offered: [curve25519-sha256@libssh.org]"))
+				Expect(client).To(BeNil())
 			})
 		})
 	})
@@ -653,6 +712,92 @@ var _ = Describe("SSH daemon", func() {
 				line, err := reader.ReadString('\n')
 				Expect(err).NotTo(HaveOccurred())
 				Expect(line).To(ContainSubstring("hi from jim"))
+			})
+		})
+
+		Context("when a client requests a remote port forward", func() {
+			var (
+				server *ghttp.Server
+				ln     net.Listener
+			)
+
+			BeforeEach(func() {
+				server = ghttp.NewServer()
+				server.AppendHandlers(
+					ghttp.RespondWith(http.StatusOK, "hello from the other side\n"),
+				)
+			})
+
+			JustBeforeEach(func() {
+				var err error
+				ln, err = client.Listen("tcp", "127.0.0.1:0")
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("forwards the remote port from server side to the target", func() {
+				go func() {
+					for {
+						conn, err := ln.Accept()
+						if err != nil {
+							return
+						}
+
+						proxyConn, err := net.Dial("tcp", server.Addr())
+						if err != nil {
+							return
+						}
+
+						wg := sync.WaitGroup{}
+						wg.Add(2)
+
+						go func() {
+							_, _ = io.Copy(conn, proxyConn)
+							wg.Done()
+						}()
+
+						go func() {
+							_, _ = io.Copy(proxyConn, conn)
+							wg.Done()
+						}()
+
+						wg.Wait()
+					}
+				}()
+
+				resp, err := http.Get(fmt.Sprintf("http://%s", ln.Addr()))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(resp.StatusCode).To(Equal(http.StatusOK))
+
+				reader := bufio.NewReader(resp.Body)
+				line, err := reader.ReadString('\n')
+				Expect(err).NotTo(HaveOccurred())
+				Expect(line).To(ContainSubstring("hello from the other side"))
+			})
+
+			Context("when the connection is closed", func() {
+				JustBeforeEach(func() {
+					Expect(client.Close()).To(Succeed())
+				})
+
+				It("closes the listeners associated with this conn", func() {
+					Eventually(func() error {
+						_, err := http.Get(fmt.Sprintf("http://%s", ln.Addr()))
+						return err
+					}).Should(MatchError(ContainSubstring("refused")))
+				})
+			})
+
+			Context("when the listener is closed", func() {
+				JustBeforeEach(func() {
+					Expect(ln.Close()).To(Succeed())
+				})
+
+				It("responds with a connection refused error to clients", func() {
+					Eventually(func() error {
+						_, err := http.Get(fmt.Sprintf("http://%s", ln.Addr()))
+						return err
+					}).Should(MatchError(ContainSubstring("refused")))
+				})
 			})
 		})
 	})
